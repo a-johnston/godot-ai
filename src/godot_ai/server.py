@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -32,6 +33,14 @@ from godot_ai.resources.scenes import register_scene_resources
 from godot_ai.resources.scripts import register_script_resources
 from godot_ai.resources.sessions import register_session_resources
 from godot_ai.sessions.registry import SessionRegistry
+from godot_ai.telemetry import (
+    MilestoneType,
+    RecordType,
+    install_fastmcp_wraps,
+    record_milestone,
+    record_telemetry,
+    shutdown_if_initialized,
+)
 from godot_ai.tools.animation import register_animation_tools
 from godot_ai.tools.audio import register_audio_tools
 from godot_ai.tools.autoload import register_autoload_tools
@@ -106,14 +115,47 @@ def create_server(
         ws_task = asyncio.create_task(ws_server.start())
         logger.info("WebSocket server starting on port %d", ws_server.port)
 
+        ## Defer initial telemetry off the lifespan start tick — mirrors
+        ## unity-mcp's 1s stdio-handshake guard so the first POST never
+        ## races the MCP protocol's own startup chatter. Scheduled via
+        ## the running loop (not a ``threading.Timer``) so a fast
+        ## shutdown cancels the pending callback cleanly instead of
+        ## leaving a non-daemon thread alive past lifespan teardown.
+        start_clk = time.perf_counter()
+
+        def _emit_startup() -> None:
+            try:
+                record_telemetry(
+                    RecordType.STARTUP,
+                    {
+                        "server_version": _SERVER_VERSION,
+                        "ws_port": ws_port,
+                        "lifespan_start_ms": (time.perf_counter() - start_clk) * 1000.0,
+                    },
+                )
+                record_milestone(MilestoneType.FIRST_STARTUP)
+            except Exception:  # noqa: BLE001
+                logger.debug("Startup telemetry failed", exc_info=True)
+
+        loop = asyncio.get_running_loop()
+        startup_handle = loop.call_later(1.0, _emit_startup)
+
         try:
             yield AppContext(registry=registry, ws_server=ws_server, client=client)
         finally:
+            startup_handle.cancel()
             ws_task.cancel()
             try:
                 await ws_task
             except (asyncio.CancelledError, OSError):
                 pass
+            ## Use ``shutdown_if_initialized`` so an opted-out server
+            ## (which never created a collector) doesn't get one
+            ## materialized solely to be shut down.
+            try:
+                shutdown_if_initialized()
+            except Exception:  # noqa: BLE001
+                logger.debug("Telemetry shutdown failed", exc_info=True)
 
     mcp = GodotAIFastMCP(
         "Godot AI",
@@ -216,6 +258,15 @@ def create_server(
     mcp.add_middleware(StripClientWrapperKwargs())
     mcp.add_middleware(ParseStringifiedParams())
     mcp.add_middleware(HintOpTypoOnManage())
+
+    ## Wrap ``mcp.tool`` / ``mcp.resource`` once, before any
+    ## ``register_*`` call below, so every tool and resource registered
+    ## downstream is automatically instrumented for telemetry without
+    ## per-domain awareness. This includes the rollup ``<domain>_manage``
+    ## tools registered via ``register_manage_tool`` — its inner
+    ## ``manage`` closure exposes ``op`` as a parameter, which the
+    ## telemetry decorator captures as ``sub_action`` automatically.
+    install_fastmcp_wraps(mcp)
 
     exclude = set(exclude_domains or ())
     if exclude:
